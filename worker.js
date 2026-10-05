@@ -1998,7 +1998,6 @@ function getHtmlTemplate(
     .media-title {
       font-size:
         1.1rem;
-
       font-weight:
         600;
 
@@ -2994,7 +2993,22 @@ function getHtmlTemplate(
       );
 
 
-    if (fileObj) {
+    // Plik może być:
+    // - zwykłym plikiem z polem url
+    // - plikiem wieloczęściowym z polem parts
+    // Folder może również być obiektem albo tablicą, więc samo
+    // sprawdzenie fileObj błędnie traktuje bezpośredni URL folderu jako plik.
+    //
+    // Nie zmieniamy obsługi multipart — tylko poprawnie rozróżniamy
+    // plik od folderu na potrzeby routingu klienta.
+    if (
+      fileObj &&
+      !Array.isArray(fileObj) &&
+      (
+        typeof fileObj.url === "string" ||
+        Array.isArray(fileObj.parts)
+      )
+    ) {
 
       const targetFileEl =
         findFileElement(
