@@ -1,4 +1,4 @@
-﻿import discord
+import discord
 from discord.ext import commands
 from discord import app_commands
 import requests
@@ -48,7 +48,8 @@ async def build_and_push_data(bot: commands.Bot):
                             direct_files.append({
                                 "name": att.filename,
                                 "url": att.url,
-                                "size": f"{round(att.size / (1024 * 1024), 2)} MB"
+                                "size": f"{round(att.size / (1024 * 1024), 2)} MB",
+                                "bytes": att.size
                             })
             except Exception as e:
                 print(f"[OSTRZEŻENIE] Błąd podczas pobierania historii kanału {chan_name}: {e}")
@@ -78,7 +79,8 @@ async def build_and_push_data(bot: commands.Bot):
                                 file_list.append({
                                     "name": att.filename,
                                     "url": att.url,
-                                    "size": f"{round(att.size / (1024 * 1024), 2)} MB"
+                                    "size": f"{round(att.size / (1024 * 1024), 2)} MB",
+                                    "bytes": att.size
                                 })
                 except Exception as e:
                     print(f"[OSTRZEŻENIE] Błąd podczas pobierania historii wątku {thread_name}: {e}")
