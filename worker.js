@@ -131,7 +131,8 @@ function normalizeFile(fileObj) {
       .filter(part => part && part.url)
       .map(part => ({
         url: part.url,
-        size: part.size
+        size: part.size,
+        bytes: part.bytes
       }));
 
     if (!parts.length) {
@@ -158,7 +159,8 @@ function normalizeFile(fileObj) {
       parts: [
         {
           url: fileObj.url,
-          size: fileObj.size
+          size: fileObj.size,
+          bytes: fileObj.bytes
         }
       ]
     };
@@ -274,7 +276,10 @@ function processStructure(data) {
           //
           // Nie robimy tutaj Number(),
           // ponieważ Number("950.0 MB") === NaN.
-          size: part.size
+          size: part.size,
+
+          // Dokładny rozmiar w bajtach (z bota), jeśli jest.
+          bytes: part.bytes
         }));
 
       result.push({
@@ -385,6 +390,21 @@ function getCookie(cookieHeader, name) {
 // Dzięki temu "950.0 MB" nie staje się 0.
 //
 
+// Cache rozmiarów w obrębie izolatu Workera.
+//
+// Klucz to URL bez query string — Discord zmienia
+// parametry podpisu (ex/is/hm) przy odświeżeniu linków,
+// ale sam plik pozostaje ten sam.
+//
+// Bez tego każdy request (a IDM robi ich dużo) wysyłał
+// HEAD do każdej części przed wysłaniem pierwszego bajtu.
+const PART_SIZE_CACHE = new Map();
+const PART_SIZE_CACHE_LIMIT = 5000;
+
+function getPartCacheKey(url) {
+  return String(url).split("?")[0];
+}
+
 async function resolveRemoteSize(part) {
   if (!part || !part.url) {
     throw new Error(
@@ -394,21 +414,85 @@ async function resolveRemoteSize(part) {
 
   // Jeśli mamy dokładny rozmiar numeryczny,
   // możemy go wykorzystać bez requestu.
-  if (
-    typeof part.size === "number" &&
-    Number.isFinite(part.size) &&
-    part.size > 0
-  ) {
-    return Math.floor(part.size);
+  //
+  // "bytes" zapisuje bot (att.size), "size" może być
+  // liczbą w ręcznie przygotowanych danych.
+  for (const exact of [part.bytes, part.size]) {
+    if (
+      typeof exact === "number" &&
+      Number.isFinite(exact) &&
+      exact > 0
+    ) {
+      return Math.floor(exact);
+    }
   }
 
+  const cacheKey =
+    getPartCacheKey(part.url);
+
+  const cached =
+    PART_SIZE_CACHE.get(cacheKey);
+
+  if (cached) {
+    return cached;
+  }
+
+  const detected =
+    await detectRemoteSize(part.url);
+
+  if (detected > 0) {
+    if (
+      PART_SIZE_CACHE.size >=
+      PART_SIZE_CACHE_LIMIT
+    ) {
+      PART_SIZE_CACHE.clear();
+    }
+
+    PART_SIZE_CACHE.set(
+      cacheKey,
+      detected
+    );
+
+    return detected;
+  }
+
+  // -------------------------------------------------------
+  // FALLBACK DO SIZE Z JSON
+  // -------------------------------------------------------
+  //
+  // Nie cache'ujemy — "123.45 MB" jest zaokrąglone,
+  // więc to tylko ostateczność.
+
+  const fallback = parseSizeToBytes(
+    part.size
+  );
+
+  if (fallback > 0) {
+    console.warn(
+      "Using fallback size for:",
+      part.url,
+      fallback
+    );
+
+    return fallback;
+  }
+
+  throw new Error(
+    "Nie można ustalić rozmiaru remote file: " +
+    part.url
+  );
+}
+
+
+// Zwraca rozmiar z HEAD / Range 0-0 albo 0.
+async function detectRemoteSize(url) {
   // -------------------------------------------------------
   // 1. HEAD
   // -------------------------------------------------------
 
   try {
     const headResponse = await fetch(
-      part.url,
+      url,
       {
         method: "HEAD",
         redirect: "follow"
@@ -443,7 +527,7 @@ async function resolveRemoteSize(part) {
 
   try {
     const rangeResponse = await fetch(
-      part.url,
+      url,
       {
         method: "GET",
         headers: {
@@ -517,41 +601,25 @@ async function resolveRemoteSize(part) {
     );
   }
 
-  // -------------------------------------------------------
-  // 3. FALLBACK DO SIZE Z JSON
-  // -------------------------------------------------------
-
-  const fallback = parseSizeToBytes(
-    part.size
-  );
-
-  if (fallback > 0) {
-    console.warn(
-      "Using fallback size for:",
-      part.url,
-      fallback
-    );
-
-    return fallback;
-  }
-
-  throw new Error(
-    "Nie można ustalić rozmiaru remote file: " +
-    part.url
-  );
+  return 0;
 }
 
 
 // =========================================================
 // USTALENIE ROZMIARÓW WSZYSTKICH PARTS
 // =========================================================
+//
+// Równolegle — sekwencyjne HEAD-y do kilkunastu części
+// dawały ~1.5 s opóźnienia na każdy request.
+//
 
 async function resolveAllPartSizes(parts) {
-  const resolved = [];
+  const sizes = await Promise.all(
+    parts.map(resolveRemoteSize)
+  );
 
-  for (const part of parts) {
-    const size =
-      await resolveRemoteSize(part);
+  return parts.map((part, index) => {
+    const size = sizes[index];
 
     if (
       !Number.isFinite(size) ||
@@ -563,13 +631,11 @@ async function resolveAllPartSizes(parts) {
       );
     }
 
-    resolved.push({
+    return {
       url: part.url,
       size
-    });
-  }
-
-  return resolved;
+    };
+  });
 }
 
 
@@ -741,47 +807,21 @@ function getMimeType(fileName) {
 
 
 // =========================================================
-// STREAM REMOTE RANGE
+// OTWARCIE FRAGMENTU REMOTE PART
 // =========================================================
 //
 // Pobiera tylko odpowiedni fragment fizycznej części.
 //
-// Jeśli CDN respektuje Range:
-//
-//   206 Partial Content
-//
-// to dane idą bezpośrednio.
-//
-// Jeśli CDN ignoruje Range i zwraca:
-//
-//   200 OK
-//
-// wtedy pomijamy początkowe bajty lokalnie.
-//
 
-async function streamRemoteRange(
-  url,
-  requestedStart,
-  requestedEnd,
-  writer
-) {
-  const wantedBytes =
-    requestedEnd -
-    requestedStart +
-    1;
-
-  if (wantedBytes <= 0) {
-    return 0;
-  }
-
+async function openRemoteRange(segment) {
   const response =
     await fetch(
-      url,
+      segment.url,
       {
         method: "GET",
         headers: {
           Range:
-            `bytes=${requestedStart}-${requestedEnd}`
+            `bytes=${segment.start}-${segment.end}`
         },
         redirect: "follow"
       }
@@ -792,7 +832,7 @@ async function streamRemoteRange(
   ) {
     throw new Error(
       `Remote server rejected Range ` +
-      `${requestedStart}-${requestedEnd}`
+      `${segment.start}-${segment.end}`
     );
   }
 
@@ -812,15 +852,140 @@ async function streamRemoteRange(
     );
   }
 
+  return response;
+}
+
+
+// =========================================================
+// PRZEPISANIE FRAGMENTU DO ODPOWIEDZI
+// =========================================================
+//
+// Jeśli CDN zwrócił dokładnie żądany zakres (206 z pasującym
+// Content-Range), body idzie natywnym pipeTo — bez JS
+// na każdy chunk, więc bez zużywania CPU time.
+//
+// W przeciwnym razie (np. CDN zignorował Range i zwrócił
+// 200 z całym plikiem) przycinamy dane w JS.
+//
+
+async function pipeRemoteRange(
+  response,
+  segment,
+  writable
+) {
+  const contentRange =
+    response.headers.get(
+      "Content-Range"
+    ) || "";
+
+  const match =
+    contentRange.match(
+      /bytes\s+(\d+)-(\d+)\//i
+    );
+
+  const isExactRange =
+    response.status === 206 &&
+    match &&
+    Number(match[1]) === segment.start &&
+    Number(match[2]) === segment.end;
+
+  if (isExactRange) {
+    await response.body.pipeTo(
+      writable,
+      {
+        preventClose: true
+      }
+    );
+
+    return;
+  }
+
+  const writer =
+    writable.getWriter();
+
+  try {
+    await streamRemoteRange(
+      response,
+      segment.start,
+      segment.end,
+      writer,
+      segment.url
+    );
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+
+// =========================================================
+// STREAM REMOTE RANGE (FALLBACK)
+// =========================================================
+//
+// Jeśli CDN respektuje Range, ale zwrócił inny zakres
+// niż żądany, albo ignoruje Range i zwraca:
+//
+//   200 OK
+//
+// wtedy pomijamy początkowe bajty lokalnie.
+//
+
+async function streamRemoteRange(
+  response,
+  requestedStart,
+  requestedEnd,
+  writer,
+  url
+) {
+  const wantedBytes =
+    requestedEnd -
+    requestedStart +
+    1;
+
+  if (wantedBytes <= 0) {
+    try {
+      await response.body.cancel();
+    } catch (_) {}
+
+    return 0;
+  }
+
   const reader =
     response.body.getReader();
 
   let received = 0;
-  let skipped = 0;
 
-  // true jeśli remote ignorował Range.
+  // Offset pierwszego bajtu, który faktycznie przysłał
+  // remote: 0 gdy zignorował Range (200), albo początek
+  // z Content-Range gdy przysłał inny zakres niż żądany.
+  const remoteStartMatch =
+    (
+      response.headers.get(
+        "Content-Range"
+      ) || ""
+    ).match(
+      /bytes\s+(\d+)-/i
+    );
+
+  let skipped =
+    response.status === 206 &&
+    remoteStartMatch
+      ? Number(remoteStartMatch[1])
+      : 0;
+
+  if (skipped > requestedStart) {
+    try {
+      await response.body.cancel();
+    } catch (_) {}
+
+    throw new Error(
+      `Remote server returned range starting at ` +
+      `${skipped}, requested ${requestedStart}`
+    );
+  }
+
+  // true jeśli trzeba pominąć początkowe bajty.
   const serverIgnoredRange =
-    response.status === 200;
+    skipped < requestedStart;
 
   try {
     while (
@@ -957,7 +1122,8 @@ async function streamRemoteRange(
 
 async function streamVirtualFile(
   file,
-  request
+  request,
+  ctx
 ) {
   // -------------------------------------------------------
   // Ustal prawdziwe rozmiary wszystkich części.
@@ -1135,11 +1301,69 @@ async function streamVirtualFile(
   }
 
   // -------------------------------------------------------
+  // FRAGMENTY CZĘŚCI POKRYWAJĄCE ŻĄDANY ZAKRES
+  // -------------------------------------------------------
+
+  const segments = [];
+  let currentPartStart = 0;
+
+  for (const part of parts) {
+    const partStart =
+      currentPartStart;
+
+    const partEnd =
+      currentPartStart +
+      part.size -
+      1;
+
+    currentPartStart +=
+      part.size;
+
+    // Ta część nie przecina
+    // żądanego virtual range.
+    if (
+      end < partStart ||
+      start > partEnd
+    ) {
+      continue;
+    }
+
+    segments.push({
+      url: part.url,
+
+      // Zakres lokalny wewnątrz konkretnego parta.
+      start: Math.max(
+        0,
+        start - partStart
+      ),
+
+      end: Math.min(
+        part.size - 1,
+        end - partStart
+      )
+    });
+  }
+
+  // Pierwszy fragment otwieramy PRZED wysłaniem nagłówków,
+  // żeby wygasły link / błąd CDN dał czytelny 502,
+  // a nie ucięty plik.
+  const firstSource =
+    await openRemoteRange(
+      segments[0]
+    );
+
+  // -------------------------------------------------------
   // STREAM
   // -------------------------------------------------------
   //
   // FixedLengthStream jest ważny w Cloudflare Workers,
   // ponieważ deklarujemy dokładną długość body.
+  //
+  // Dane NIE przechodzą przez JS chunk po chunku —
+  // pipeTo() między strumieniami runtime'u działa natywnie
+  // i nie zużywa CPU time Workera. Wcześniejsza pętla
+  // reader.read() / writer.write() wyczerpywała limit CPU
+  // po ~1-4 MB i Cloudflare ucinał połączenie.
   //
 
   const fixedStream =
@@ -1147,66 +1371,28 @@ async function streamVirtualFile(
       contentLength
     );
 
-  const writer =
-    fixedStream.writable
-      .getWriter();
-
-  // -------------------------------------------------------
-  // ASYNCHRONICZNE STREAMOWANIE
-  // -------------------------------------------------------
-
-  (async () => {
+  const pump = (async () => {
     try {
-      let currentPartStart = 0;
-
       for (
-        const part of parts
+        let index = 0;
+        index < segments.length;
+        index++
       ) {
-        const partStart =
-          currentPartStart;
+        const source =
+          index === 0
+            ? firstSource
+            : await openRemoteRange(
+                segments[index]
+              );
 
-        const partEnd =
-          currentPartStart +
-          part.size -
-          1;
-
-        currentPartStart +=
-          part.size;
-
-        // Ta część nie przecina
-        // żądanego virtual range.
-        if (
-          end < partStart ||
-          start > partEnd
-        ) {
-          continue;
-        }
-
-        // -------------------------------------------------
-        // Zakres lokalny wewnątrz konkretnego parta.
-        // -------------------------------------------------
-
-        const localStart =
-          Math.max(
-            0,
-            start - partStart
-          );
-
-        const localEnd =
-          Math.min(
-            part.size - 1,
-            end - partStart
-          );
-
-        await streamRemoteRange(
-          part.url,
-          localStart,
-          localEnd,
-          writer
+        await pipeRemoteRange(
+          source,
+          segments[index],
+          fixedStream.writable
         );
       }
 
-      await writer.close();
+      await fixedStream.writable.close();
     } catch (error) {
       console.error(
         "Błąd podczas streamowania virtual file:",
@@ -1214,12 +1400,16 @@ async function streamVirtualFile(
       );
 
       try {
-        await writer.abort(
+        await fixedStream.writable.abort(
           error
         );
       } catch (_) {}
     }
   })();
+
+  if (ctx) {
+    ctx.waitUntil(pump);
+  }
 
   return new Response(
     fixedStream.readable,
@@ -3809,7 +3999,8 @@ export default {
           const response =
             await streamVirtualFile(
               normalized,
-              request
+              request,
+              ctx
             );
 
 
