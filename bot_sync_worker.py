@@ -46,9 +46,14 @@ def check_episodes(file_list, context_name):
     
     if episodes:
         max_ep = max(episodes)
-        missing = [ep for ep in range(1, max_ep + 1) if ep not in episodes]
+        # Tworzymy listę brakujących i sortujemy ją
+        missing = sorted([ep for ep in range(1, max_ep + 1) if ep not in episodes])
+        
         if missing:
-            messages.append(f"[OSTRZEŻENIE] W '{context_name}' brakuje odcinków (do maks {max_ep}): {missing}")
+            # Formatuje liczby dodając zera na początku, np. E03 zamiast 3
+            missing_str = ", ".join([f"E{ep:02d}" for ep in missing])
+            max_str = f"E{max_ep:02d}"
+            messages.append(f"[OSTRZEŻENIE] W '{context_name}' brakuje odcinków: {missing_str} (najwyższy wrzucony to {max_str})")
             
     return messages
 
@@ -87,6 +92,21 @@ def check_multiparts(file_list, context_name):
             messages.append(f"[OSTRZEŻENIE] W '{context_name}' brakuje części dla '{base_name}': part{missing}")
         elif last_part is not None:
             messages.append(f"[SUKCES] {base_name} w '{context_name}' jest kompletne.")
+            
+    return messages
+
+def check_duplicates(file_list, context_name):
+    """Sprawdza czy na liście nie ma zduplikowanych plików (po nazwie)."""
+    messages = []
+    name_counts = {}
+    
+    for f in file_list:
+        name = f["name"]
+        name_counts[name] = name_counts.get(name, 0) + 1
+        
+    for name, count in name_counts.items():
+        if count > 1:
+            messages.append(f"[OSTRZEŻENIE] W '{context_name}' znaleziono duplikat pliku ({count}x): '{name}'")
             
     return messages
 
@@ -248,8 +268,9 @@ async def staty(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="check", description="Sprawdza kompletność partów i odcinków w pamięci bota")
-async def check_files(interaction: discord.Interaction):
+@bot.tree.command(name="check", description="Sprawdza kompletność partów, odcinków i duplikaty w pamięci bota")
+@app_commands.describe(only_warns="Pokaż tylko ostrzeżenia (ukrywa sukcesy). Domyślnie: True")
+async def check_files(interaction: discord.Interaction, only_warns: bool = True):
     if interaction.user.id not in ALLOWED_USERS:
         return await interaction.response.send_message("Nie masz uprawnień do tej komendy.", ephemeral=True)
 
@@ -267,26 +288,34 @@ async def check_files(interaction: discord.Interaction):
                 # Zwykła tablica plików bez wątków
                 report_lines.extend(check_episodes(chan_data, chan_name))
                 report_lines.extend(check_multiparts(chan_data, chan_name))
+                report_lines.extend(check_duplicates(chan_data, chan_name))
             elif isinstance(chan_data, dict):
                 # Tablice plików podzielone na wątki
                 for thread_name, file_list in chan_data.items():
                     context = f"{chan_name} -> {thread_name}"
                     report_lines.extend(check_episodes(file_list, context))
                     report_lines.extend(check_multiparts(file_list, context))
+                    report_lines.extend(check_duplicates(file_list, context))
+
+    # Odfiltrowanie wiadomości oznaczonych jako [SUKCES], jeśli only_warns jest True
+    if only_warns:
+        report_lines = [line for line in report_lines if "[OSTRZEŻENIE]" in line]
 
     if not report_lines:
-        return await interaction.followup.send("✅ Wszystkie wrzucone odcinki i party wyglądają na kompletne!")
+        if only_warns:
+            return await interaction.followup.send("✅ Brak ostrzeżeń! Wszystkie sprawdzane pliki wydają się kompletne.")
+        else:
+            return await interaction.followup.send("✅ Wszystkie wrzucone pliki, odcinki i party wyglądają na kompletne! Brak duplikatów.")
 
     full_report = "\n".join(report_lines)
 
-    # Sprawdzenie czy raport zmieści się w jednej wiadomości tekstowej na Discord (limit 2000, dajemy margines do 1900)
+    # Sprawdzenie czy raport zmieści się w jednej wiadomości tekstowej na Discord
     if len(full_report) > 1900:
         file_obj = io.BytesIO(full_report.encode('utf-8'))
         discord_file = discord.File(file_obj, filename="raport_braki.txt")
-        await interaction.followup.send("⚠️ Znalazłem braki/ostrzeżenia, ale lista była za długa. Przesyłam w załączniku:", file=discord_file)
+        await interaction.followup.send("⚠️ Znalazłem raporty, ale lista była za długa. Przesyłam w załączniku:", file=discord_file)
     else:
-        await interaction.followup.send(f"⚠️ Znalezione braki i statusy:\n```\n{full_report}\n```")
-
+        await interaction.followup.send(f"⚠️ Znalezione raporty:\n```\n{full_report}\n```")
 
 # ---------------------------------------------------------
 # ZDARZENIA AUTOMATYCZNE (DODANIE / USUNIĘCIE PLIKU)
