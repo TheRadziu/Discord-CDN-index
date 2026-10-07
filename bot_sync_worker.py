@@ -4,6 +4,9 @@ from discord import app_commands
 import requests
 import asyncio
 import os
+import datetime
+import re
+import io
 
 # ---------------------------------------------------------
 # KONFIGURACJA
@@ -18,17 +21,89 @@ WORKER_SECRET = "ja_j4b4_chuj_serniktopedal"
 # Lista ID użytkowników uprawnionych do ręcznego wywołania syncu
 ALLOWED_USERS = [67676767676767]
 
+# Zmienne globalne przetrzymujące stan z ostatniej synchronizacji
+GLOBAL_TOTAL_BYTES = 0
+GLOBAL_STRUCTURE = {}
+
+# ---------------------------------------------------------
+# FUNKCJE POMOCNICZE
+# ---------------------------------------------------------
+def log(tag, message):
+    """Odpowiada za ustandaryzowane formatowanie printów z datą."""
+    now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    print(f"[{now}] [{tag}] {message}")
+
+def check_episodes(file_list, context_name):
+    """Sprawdza ciągłość odcinków i zwraca listę logów (ostrzeżeń)."""
+    messages = []
+    episodes = set()
+    
+    for f in file_list:
+        # Szuka wzorca np. S01E05, S1E5, E12, E012
+        match = re.search(r'(?i)(?:S\d{1,2})?E(\d{1,4})', f["name"])
+        if match:
+            episodes.add(int(match.group(1)))
+    
+    if episodes:
+        max_ep = max(episodes)
+        missing = [ep for ep in range(1, max_ep + 1) if ep not in episodes]
+        if missing:
+            messages.append(f"[OSTRZEŻENIE] W '{context_name}' brakuje odcinków (do maks {max_ep}): {missing}")
+            
+    return messages
+
+def check_multiparts(file_list, context_name):
+    """Sprawdza kompletność plików .partXX i zwraca listę logów (ostrzeżenia i sukcesy)."""
+    messages = []
+    files_dict = {}
+    
+    for f in file_list:
+        match = re.search(r'(?i)^(.*?)\.part(\d+)(.*?)$', f["name"])
+        if match:
+            base_name = match.group(1) + match.group(3)
+            part_num = int(match.group(2))
+            size = f["bytes"]
+
+            if base_name not in files_dict:
+                files_dict[base_name] = {"parts": set(), "last_part": None}
+            
+            files_dict[base_name]["parts"].add(part_num)
+            
+            # Wg PowerShell part mniejszy niż 996147200 (950MB) oznacza koniec pliku
+            if size < 996147200:
+                files_dict[base_name]["last_part"] = part_num
+    
+    for base_name, data in files_dict.items():
+        parts = data["parts"]
+        last_part = data["last_part"]
+
+        if not parts:
+            continue
+        
+        target_max = last_part if last_part is not None else max(parts)
+        missing = [p for p in range(1, target_max + 1) if p not in parts]
+
+        if missing:
+            messages.append(f"[OSTRZEŻENIE] W '{context_name}' brakuje części dla '{base_name}': part{missing}")
+        elif last_part is not None:
+            messages.append(f"[SUKCES] {base_name} w '{context_name}' jest kompletne.")
+            
+    return messages
+
 # ---------------------------------------------------------
 # FUNKCJE BUDOWANIA I WYSYŁANIA DANYCH
 # ---------------------------------------------------------
 async def build_and_push_data(bot: commands.Bot):
     """Skanuje Serwer A i wysyła pełną strukturę JSON do Cloudflare Workera."""
+    global GLOBAL_TOTAL_BYTES, GLOBAL_STRUCTURE
+    
     guild = bot.get_guild(SERVER_A_ID)
     if not guild:
-        print("[BŁĄD] Nie znaleziono Serwera A!")
+        log("BŁĄD", "Nie znaleziono Serwera A!")
         return False
 
     structure = {}
+    current_total_bytes = 0
 
     for category in guild.categories:
         cat_name = category.name
@@ -36,15 +111,13 @@ async def build_and_push_data(bot: commands.Bot):
 
         for channel in category.text_channels:
             chan_name = channel.name
-
-            # -----------------------------------------------------
-            # 1. POBIERANIE PLIKÓW BEZPOŚREDNIO Z KANAŁU (POZA WĄTKAMI)
-            # -----------------------------------------------------
             direct_files = []
+
             try:
                 async for msg in channel.history(limit=None, oldest_first=True):
                     if msg.attachments and not msg.author.bot:
                         for att in msg.attachments:
+                            current_total_bytes += att.size
                             direct_files.append({
                                 "name": att.filename,
                                 "url": att.url,
@@ -52,20 +125,17 @@ async def build_and_push_data(bot: commands.Bot):
                                 "bytes": att.size
                             })
             except Exception as e:
-                print(f"[OSTRZEŻENIE] Błąd podczas pobierania historii kanału {chan_name}: {e}")
+                log("OSTRZEŻENIE", f"Błąd podczas pobierania historii kanału {chan_name}: {e}")
 
             if direct_files:
                 direct_files.sort(key=lambda x: x["name"].lower())
 
-            # -----------------------------------------------------
-            # 2. POBIERANIE PLIKÓW Z WĄTKÓW (AKTYWNYCH I ZARCHIWIZOWANYCH)
-            # -----------------------------------------------------
             threads = list(channel.threads)
             try:
                 async for archived_thread in channel.archived_threads(limit=None):
                     threads.append(archived_thread)
             except Exception as e:
-                print(f"[OSTRZEŻENIE] Błąd podczas pobierania archiwum wątków w {chan_name}: {e}")
+                log("OSTRZEŻENIE", f"Błąd podczas pobierania archiwum wątków w {chan_name}: {e}")
 
             threads_dict = {}
             for thread in threads:
@@ -76,6 +146,7 @@ async def build_and_push_data(bot: commands.Bot):
                     async for msg in thread.history(limit=None, oldest_first=True):
                         if msg.attachments and not msg.author.bot:
                             for att in msg.attachments:
+                                current_total_bytes += att.size
                                 file_list.append({
                                     "name": att.filename,
                                     "url": att.url,
@@ -83,19 +154,14 @@ async def build_and_push_data(bot: commands.Bot):
                                     "bytes": att.size
                                 })
                 except Exception as e:
-                    print(f"[OSTRZEŻENIE] Błąd podczas pobierania historii wątku {thread_name}: {e}")
+                    log("OSTRZEŻENIE", f"Błąd podczas pobierania historii wątku {thread_name}: {e}")
 
                 if file_list:
                     file_list.sort(key=lambda x: x["name"].lower())
                     threads_dict[thread_name] = file_list
 
-            # -----------------------------------------------------
-            # 3. STRUKTURALIZACJA BEZ DUBLOWANIA
-            # -----------------------------------------------------
-            # Jeśli brak wątków, a są tylko pliki na kanale -> przypisz bezpośrednio tablicę
             if direct_files and not threads_dict:
                 cat_dict[chan_name] = direct_files
-            # Jeśli są wątki (z plikami lub bez plików na kanale głównym)
             elif threads_dict:
                 if direct_files:
                     threads_dict["Inne pliki"] = direct_files
@@ -103,6 +169,10 @@ async def build_and_push_data(bot: commands.Bot):
 
         if cat_dict:
             structure[cat_name] = cat_dict
+
+    # Zapisz do pamięci bota po przeskanowaniu
+    GLOBAL_TOTAL_BYTES = current_total_bytes
+    GLOBAL_STRUCTURE = structure
 
     # Wysyłanie wygenerowanego JSON-a do Workera
     headers = {
@@ -117,13 +187,13 @@ async def build_and_push_data(bot: commands.Bot):
             lambda: requests.post(WORKER_URL, json=structure, headers=headers, timeout=10)
         )
         if response.status_code == 200:
-            print("[SUKCES] Zaktualizowano strukturę w Cloudflare Workerze!")
+            log("SUKCES", "Zaktualizowano strukturę w Cloudflare Workerze!")
             return True
         else:
-            print(f"[BŁĄD HTTP] Worker zwrócił kod {response.status_code}: {response.text}")
+            log("BŁĄD HTTP", f"Worker zwrócił kod {response.status_code}: {response.text}")
             return False
     except Exception as e:
-        print(f"[BŁĄD SIECI] Nie udało się połączyć z Cloudflare Workerem: {e}")
+        log("BŁĄD SIECI", f"Nie udało się połączyć z Cloudflare Workerem: {e}")
         return False
 
 # ---------------------------------------------------------
@@ -139,18 +209,18 @@ class SiteSyncBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
-        print("Zsynchronizowano komendy Slash (/)")
+        log("INFO", "Zsynchronizowano komendy Slash (/)")
 
 bot = SiteSyncBot()
 
 @bot.event
 async def on_ready():
-    print(f'Zalogowano jako {bot.user} (Site Sync Bot)')
-    print("Inicjalizacja pierwszej synchronizacji ze stroną...")
+    log("INFO", f'Zalogowano jako {bot.user} (Site Sync Bot)')
+    log("INFO", "Inicjalizacja pierwszej synchronizacji ze stroną...")
     await build_and_push_data(bot)
 
 # ---------------------------------------------------------
-# KOMENDA SLASH DO RĘCZNEJ SYNCHRONIZACJI
+# KOMENDY SLASH
 # ---------------------------------------------------------
 @bot.tree.command(name="update_site", description="Ręcznie aktualizuje strukturę plików na stronie WWW")
 async def update_site(interaction: discord.Interaction):
@@ -165,22 +235,74 @@ async def update_site(interaction: discord.Interaction):
     else:
         await interaction.followup.send("Wystąpił błąd podczas aktualizacji strony. Sprawdź konsolę bota.")
 
+@bot.tree.command(name="staty", description="Pokazuje łączną ilość udostępnionych danych na serwerze")
+async def staty(interaction: discord.Interaction):
+    mb = GLOBAL_TOTAL_BYTES / (1024 ** 2)
+    gb = GLOBAL_TOTAL_BYTES / (1024 ** 3)
+    tb = GLOBAL_TOTAL_BYTES / (1024 ** 4)
+
+    embed = discord.Embed(title="📊 Statystyki plików na serwerze", color=discord.Color.blue())
+    embed.add_field(name="TB", value=f"{tb:,.4f}", inline=True)
+    embed.add_field(name="GB", value=f"{gb:,.2f}", inline=True)
+    embed.add_field(name="MB", value=f"{mb:,.2f}", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="check", description="Sprawdza kompletność partów i odcinków w pamięci bota")
+async def check_files(interaction: discord.Interaction):
+    if interaction.user.id not in ALLOWED_USERS:
+        return await interaction.response.send_message("Nie masz uprawnień do tej komendy.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    if not GLOBAL_STRUCTURE:
+        return await interaction.followup.send("Brak danych w pamięci. Zaktualizuj stronę używając `/update_site`.")
+
+    report_lines = []
+
+    # Iterowanie przez strukturę zapisaną w pamięci (zmienna globalna)
+    for cat_name, cat_data in GLOBAL_STRUCTURE.items():
+        for chan_name, chan_data in cat_data.items():
+            if isinstance(chan_data, list):
+                # Zwykła tablica plików bez wątków
+                report_lines.extend(check_episodes(chan_data, chan_name))
+                report_lines.extend(check_multiparts(chan_data, chan_name))
+            elif isinstance(chan_data, dict):
+                # Tablice plików podzielone na wątki
+                for thread_name, file_list in chan_data.items():
+                    context = f"{chan_name} -> {thread_name}"
+                    report_lines.extend(check_episodes(file_list, context))
+                    report_lines.extend(check_multiparts(file_list, context))
+
+    if not report_lines:
+        return await interaction.followup.send("✅ Wszystkie wrzucone odcinki i party wyglądają na kompletne!")
+
+    full_report = "\n".join(report_lines)
+
+    # Sprawdzenie czy raport zmieści się w jednej wiadomości tekstowej na Discord (limit 2000, dajemy margines do 1900)
+    if len(full_report) > 1900:
+        file_obj = io.BytesIO(full_report.encode('utf-8'))
+        discord_file = discord.File(file_obj, filename="raport_braki.txt")
+        await interaction.followup.send("⚠️ Znalazłem braki/ostrzeżenia, ale lista była za długa. Przesyłam w załączniku:", file=discord_file)
+    else:
+        await interaction.followup.send(f"⚠️ Znalezione braki i statusy:\n```\n{full_report}\n```")
+
+
 # ---------------------------------------------------------
 # ZDARZENIA AUTOMATYCZNE (DODANIE / USUNIĘCIE PLIKU)
 # ---------------------------------------------------------
 @bot.event
 async def on_message(message):
-    # Reaguj tylko na wiadomości z plikami na Serwerze A
     if message.guild and message.guild.id == SERVER_A_ID:
         if message.attachments and not message.author.bot:
-            print(f"[ZDARZENIE] Wykryto nowy plik w: {message.channel.name}. Aktualizacja strony...")
-            await asyncio.sleep(2) # Krótkie opóźnienie na przetworzenie załącznika przez Discorda
+            log("ZDARZENIE", f"Wykryto nowy plik w: {message.channel.name}. Aktualizacja strony...")
+            await asyncio.sleep(2)
             await build_and_push_data(bot)
 
 @bot.event
 async def on_message_delete(message):
     if message.guild and message.guild.id == SERVER_A_ID:
-        print(f"[ZDARZENIE] Wykryto usunięcie wiadomości na Serwerze A. Aktualizacja strony...")
+        log("ZDARZENIE", "Wykryto usunięcie wiadomości na Serwerze A. Aktualizacja strony...")
         await build_and_push_data(bot)
 
 # ---------------------------------------------------------
