@@ -1,6 +1,6 @@
 
 # Discord CDN index
-As of recent update Nitro users can attach files up to 1GB in size. This PoC exploits exactly that.
+As of recent update Nitro users can attach files up to 1GB in size. This PoC uses exactly that.
 This PoC consits of two parts: a free cloudflare worker that hosts the site and discord bot that fatches all data and sends it to the worker.
 ![preview](https://github.com/TheRadziu/Discord-CDN-index/blob/main/screenshot_worker_site.png?raw=true)
 ![backend example](https://github.com/TheRadziu/Discord-CDN-index/blob/main/screenshot_backend.png?raw=true)
